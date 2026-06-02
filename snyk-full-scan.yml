@@ -2,21 +2,35 @@
 # snyk-full-scan.yml
 #
 # Runs all four Snyk scan types and groups every project under a SINGLE
-# target in the Snyk UI.
+# target in the Snyk UI, following Snyk's recommended 3-stage adoption model.
 #
-# Grouping mechanism (varies by scan type — CLI flags differ)
-# ────────────────────────────────────────────────────────────
+# ── Snyk 3-Stage CI/CD Adoption Model (per Snyk implementation docs) ───────
+#
+# Stage 1 – Expose vulnerabilities (monitor only, never block builds)
+#   Use snyk monitor to gain visibility. Do NOT fail the build yet.
+#   Teams need time to understand their vulnerability landscape first.
+#
+# Stage 2 – Gatekeeper (add snyk test, start failing builds)
+#   Once teams have triaged existing issues, add snyk test to block new ones.
+#   This is "stopping the bleeding" — preventing net-new vulnerabilities.
+#
+# Stage 3 – Continuous monitoring (test THEN monitor on success)  ← this file
+#   Run snyk test first. Only run snyk monitor if test passes, so that
+#   snapshots in the Snyk UI represent known-clean states of your build.
+#   This is the pattern implemented below.
+#
+# ── Grouping mechanism (flags differ by scan type) ──────────────────────────
 # snyk monitor         → --remote-repo-url sets the target; --project-name
 #                        differentiates projects within it
 # snyk code test       → --target-name sets the target; --project-name
 #                        differentiates projects within it
-# snyk container mon.  → target is derived from the image name; --project-name
+# snyk container mon.  → target derived from image name; --project-name
 #                        differentiates projects (no --target-name support)
 # snyk iac test        → --target-name sets the target (requires --report);
 #                        --project-name differentiates projects within it
 #
 # Note: --target-name is NOT supported by snyk monitor or snyk container
-# monitor. For those commands, use --remote-repo-url to control grouping.
+# monitor. Use --remote-repo-url to control target grouping for those.
 #
 # Scan type         CLI command          Appears in Snyk UI as
 # ────────────────  ───────────────────  ─────────────────────────────
@@ -29,9 +43,11 @@
 #   Without it, results print to stdout only (still useful for CI gates).
 #
 # Required secrets (Settings → Secrets → Actions):
-#   SNYK_TOKEN        – your Snyk service account token
-#   DOCKER_IMAGE      – image to scan, e.g. "my-org/my-app:${{ github.sha }}"
-#                       (set as a secret or env var; see env block below)
+#   SNYK_TOKEN          – Snyk service account token
+#   SLACK_WEBHOOK_URL   – Incoming webhook URL for scan result notifications
+# Required variables (Settings → Variables → Actions):
+#   SNYK_ORG_ID         – Snyk org ID (Org Settings → General → Organization ID)
+#   DOCKER_IMAGE        – Image to scan, e.g. "my-org/my-app:latest"
 ##############################################################################
 
 name: Snyk – Full Scan (all project types)
@@ -81,23 +97,10 @@ jobs:
       - name: Authenticate
         run: snyk auth ${{ secrets.SNYK_TOKEN }}
 
-      # snyk monitor pushes a snapshot; --all-projects handles monorepos.
-      # Remove --all-projects for single-manifest repos.
-      # Target grouping in the Snyk UI is controlled via --remote-repo-url,
-      # not --target-name (which is not supported by this command).
-      - name: Snyk Monitor (Open Source)
-        run: |
-          snyk monitor \
-            --all-projects \
-            --project-name="[sca] ${{ github.repository }}" \
-            --org="${{ vars.SNYK_ORG_ID }}" \
-            --remote-repo-url="https://github.com/${{ github.repository }}"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      # Test gate — runs independently of monitor so a clean snapshot is always
-      # pushed even if the gate fails. Set continue-on-error: false to block PRs.
+      # Stage 2: Test gate — runs first per the 3-stage adoption model.
+      # Set continue-on-error: false to hard-block the pipeline on findings.
       - name: Snyk Test (Open Source)
+        id: sca-test
         run: |
           snyk test \
             --all-projects \
@@ -106,6 +109,21 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true       # set to false to hard-block the pipeline
+
+      # Stage 3: Monitor — only runs when test passes so the Snyk UI snapshot
+      # always represents a known-clean build state.
+      # Target grouping is controlled via --remote-repo-url (not --target-name,
+      # which is not supported by snyk monitor).
+      - name: Snyk Monitor (Open Source)
+        if: steps.sca-test.outcome == 'success'
+        run: |
+          snyk monitor \
+            --all-projects \
+            --project-name="[sca] ${{ github.repository }}" \
+            --org="${{ vars.SNYK_ORG_ID }}" \
+            --remote-repo-url="https://github.com/${{ github.repository }}"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -125,9 +143,23 @@ jobs:
       - name: Authenticate
         run: snyk auth ${{ secrets.SNYK_TOKEN }}
 
-      # Report — uploads a snapshot to Snyk UI regardless of findings.
-      # --report always continues so the UI always gets a fresh result.
+      # Stage 2: Test gate — runs first per the 3-stage adoption model.
+      # Set continue-on-error: false to hard-block the pipeline on findings.
+      - name: Snyk Code Test
+        id: code-test
+        run: |
+          snyk code test \
+            --severity-threshold=high \
+            --org="${{ vars.SNYK_ORG_ID }}"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true       # set to false to hard-block the pipeline
+
+      # Stage 3: Report — uploads snapshot to Snyk UI only when test passes,
+      # so the UI reflects known-clean build states.
+      # --report requires a Snyk Code plan; without it, omit this step.
       - name: Snyk Code Report
+        if: steps.code-test.outcome == 'success'
         run: |
           snyk code test \
             --report \
@@ -137,18 +169,6 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
-
-      # Test gate — separate run so the threshold controls the exit code
-      # independently of the report upload above.
-      # Set continue-on-error: false to hard-block the pipeline.
-      - name: Snyk Code Test
-        run: |
-          snyk code test \
-            --severity-threshold=high \
-            --org="${{ vars.SNYK_ORG_ID }}"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true       # set to false to hard-block the pipeline
 
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -170,21 +190,11 @@ jobs:
       - name: Authenticate
         run: snyk auth ${{ secrets.SNYK_TOKEN }}
 
-      # monitor → live snapshot in Snyk UI
-      # The target in the Snyk UI is derived from the image name.
-      # Use --project-name to differentiate this project within the org.
-      - name: Snyk Container Monitor
-        run: |
-          snyk container monitor ${{ env.DOCKER_IMAGE }} \
-            --project-name="[container] ${{ env.DOCKER_IMAGE }}" \
-            --org="${{ vars.SNYK_ORG_ID }}" \
-            --file=Dockerfile
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      # Test gate — runs independently of monitor so a snapshot is always
-      # pushed even if the gate fails. Set continue-on-error: false to block PRs.
+      # Stage 2: Test gate — runs first per the 3-stage adoption model.
+      # Best practice: scan after docker build, before pushing to registry.
+      # Set continue-on-error: false to hard-block the pipeline on findings.
       - name: Snyk Container Test
+        id: container-test
         run: |
           snyk container test ${{ env.DOCKER_IMAGE }} \
             --file=Dockerfile \
@@ -193,6 +203,20 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true       # set to false to hard-block the pipeline
+
+      # Stage 3: Monitor — only runs when test passes so the Snyk UI snapshot
+      # always represents a known-clean build state.
+      # The target in Snyk UI is derived from the image name; use --project-name
+      # to differentiate this project within the org.
+      - name: Snyk Container Monitor
+        if: steps.container-test.outcome == 'success'
+        run: |
+          snyk container monitor ${{ env.DOCKER_IMAGE }} \
+            --project-name="[container] ${{ env.DOCKER_IMAGE }}" \
+            --org="${{ vars.SNYK_ORG_ID }}" \
+            --file=Dockerfile
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -212,8 +236,24 @@ jobs:
         run: snyk auth ${{ secrets.SNYK_TOKEN }}
 
       # Report — uploads a snapshot to Snyk UI regardless of findings.
+      # Stage 2: Test gate — runs first per the 3-stage adoption model.
+      # Best practice: IaC runs after SCA and Container stages in the pipeline.
       # Pass a specific path (e.g. "./infra") or use "." to scan the entire repo.
+      # Set continue-on-error: false to hard-block the pipeline on findings.
+      - name: Snyk IaC Test
+        id: iac-test
+        run: |
+          snyk iac test . \
+            --severity-threshold=high \
+            --org="${{ vars.SNYK_ORG_ID }}"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true       # set to false to hard-block the pipeline
+
+      # Stage 3: Report — uploads snapshot to Snyk UI only when test passes,
+      # so the UI reflects known-clean build states.
       - name: Snyk IaC Report
+        if: steps.iac-test.outcome == 'success'
         run: |
           snyk iac test . \
             --report \
@@ -223,18 +263,6 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
-
-      # Test gate — separate run so the threshold controls the exit code
-      # independently of the report upload above.
-      # Set continue-on-error: false to hard-block the pipeline.
-      - name: Snyk IaC Test
-        run: |
-          snyk iac test . \
-            --severity-threshold=high \
-            --org="${{ vars.SNYK_ORG_ID }}"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true       # set to false to hard-block the pipeline
 
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -265,40 +293,119 @@ jobs:
           echo ""
           echo "View all results in Snyk UI under target: ${{ env.TARGET_NAME }}"
 
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 6 – Slack Notification
+  # Posts a summary of all scan results to Slack after every run.
+  # Requires: SLACK_WEBHOOK_URL secret (Slack incoming webhook URL).
+  # Create one at: https://api.slack.com/apps → Your App → Incoming Webhooks
+  # ──────────────────────────────────────────────────────────────────────────
+  snyk-slack-notify:
+    name: Slack Notification
+    runs-on: ubuntu-latest
+    needs:
+      - snyk-open-source
+      - snyk-code
+      - snyk-container
+      - snyk-iac
+    if: always()
+    steps:
+      - name: Build Slack payload
+        id: payload
+        run: |
+          # Map job result to emoji for readability in Slack
+          result_icon() {
+            case "$1" in
+              success)  echo "✅" ;;
+              failure)  echo "❌" ;;
+              skipped)  echo "⏭️" ;;
+              *)        echo "⚠️" ;;
+            esac
+          }
+
+          SCA_ICON=$(result_icon "${{ needs.snyk-open-source.result }}")
+          CODE_ICON=$(result_icon "${{ needs.snyk-code.result }}")
+          CONTAINER_ICON=$(result_icon "${{ needs.snyk-container.result }}")
+          IAC_ICON=$(result_icon "${{ needs.snyk-iac.result }}")
+
+          # Overall status: failure if any job failed
+          if [[ "${{ needs.snyk-open-source.result }}" == "failure" || \
+                "${{ needs.snyk-code.result }}"        == "failure" || \
+                "${{ needs.snyk-container.result }}"   == "failure" || \
+                "${{ needs.snyk-iac.result }}"         == "failure" ]]; then
+            OVERALL="❌ Snyk scan found issues"
+            COLOR="danger"
+          else
+            OVERALL="✅ Snyk scan passed"
+            COLOR="good"
+          fi
+
+          cat <<EOF > slack_payload.json
+          {
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "title": "${OVERALL}",
+                "title_link": "https://app.snyk.io/org/${{ vars.SNYK_ORG_ID }}",
+                "fields": [
+                  { "title": "Repository", "value": "${{ github.repository }}", "short": true },
+                  { "title": "Branch",     "value": "${{ github.ref_name }}",   "short": true },
+                  { "title": "Open Source","value": "${SCA_ICON} ${{ needs.snyk-open-source.result }}", "short": true },
+                  { "title": "Code",       "value": "${CODE_ICON} ${{ needs.snyk-code.result }}",       "short": true },
+                  { "title": "Container",  "value": "${CONTAINER_ICON} ${{ needs.snyk-container.result }}", "short": true },
+                  { "title": "IaC",        "value": "${IAC_ICON} ${{ needs.snyk-iac.result }}",         "short": true }
+                ],
+                "footer": "Snyk CI/CD | <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>",
+                "ts": $(date +%s)
+              }
+            ]
+          }
+          EOF
+          echo "payload_file=slack_payload.json" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload-file-path: ${{ steps.payload.outputs.payload_file }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
 ##############################################################################
-# Tips for Snyk UI grouping
-# ─────────────────────────
-# CLI flag support for grouping differs by scan type:
+# Reference
+# ─────────────────────────────────────────────────────────────────────────
+# Snyk UI grouping — CLI flag support by scan type:
 #
 #   Command                  --target-name  --project-name  --remote-repo-url
 #   ──────────────────────── ─────────────  ──────────────  ─────────────────
-#   snyk monitor             ✗ (no)         ✓               ✓ (sets target)
+#   snyk monitor             ✗              ✓               ✓ (sets target)
 #   snyk code test --report  ✓              ✓               —
-#   snyk container monitor   ✗ (no)         ✓               —
+#   snyk container monitor   ✗              ✓               —
 #   snyk iac test --report   ✓              ✓               ✓
 #
-# For snyk monitor and snyk container monitor, use --remote-repo-url to
-# influence target grouping. The URL path becomes the target name in the UI.
-# Set it to the same GitHub URL across all runs to keep projects together.
+# For snyk monitor: --remote-repo-url controls the target. The URL path
+# (/org/repo) becomes the target display name in the Snyk UI.
 #
-# For snyk code test and snyk iac test, --target-name directly sets the
-# target display name. Using github.repository is recommended.
+# For snyk code test and snyk iac test: --target-name directly sets the
+# target display name. Using github.repository is recommended for consistency.
 #
-# 1. --project-name differentiates project cards within a target.
-#    Convention used here: "[type] <repo>" — easy to filter in the UI.
+# --project-name differentiates project cards within a target.
+# Convention used here: "[type] repo" — easy to filter in the UI.
 #
-# 2. For monorepos with multiple manifests, snyk monitor --all-projects
-#    auto-generates project names. Override with --project-name-prefix
-#    instead of --project-name to avoid collisions:
-#      --project-name-prefix="[sca]"
+# Monorepos: swap --project-name for --project-name-prefix when using
+# --all-projects, to avoid name collisions across multiple manifests:
+#   --project-name-prefix="[sca]"
 #
-# 3. snyk code test --report and snyk iac test --report require:
-#    - Snyk Code / IaC+ plan
-#    - SNYK_ORG_ID set as a GitHub Actions variable (vars.SNYK_ORG_ID)
-#      Find it: Snyk UI → Org Settings → General → Organization ID
+# snyk code test --report and snyk iac test --report require a Snyk Code
+# or IaC+ plan. Without the right plan, omit --report; test output still
+# prints to stdout and the CI gate still works.
 #
-# 4. To use the Snyk GitHub Action instead of the CLI directly, replace
-#    individual steps with:
-#      uses: snyk/actions/node@master   (or python, maven, docker, iac, etc.)
-#    The same flags apply via `args:`.
+# To use the official Snyk GitHub Actions instead of the CLI directly:
+#   uses: snyk/actions/node@master   (adjust for your runtime)
+# The same flags apply via the `args:` input.
+#
+# Slack webhook setup:
+#   1. Go to https://api.slack.com/apps and create or select an app
+#   2. Enable Incoming Webhooks and add a webhook to your channel
+#   3. Add the webhook URL as SLACK_WEBHOOK_URL in repo secrets
 ##############################################################################
