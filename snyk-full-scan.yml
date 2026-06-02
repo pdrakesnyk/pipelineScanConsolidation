@@ -325,8 +325,4 @@ jobs:
 #   uses: snyk/actions/node@master   (adjust for your runtime)
 # The same flags apply via the `args:` input.
 #
-# Slack webhook setup:
-#   1. Go to https://api.slack.com/apps and create or select an app
-#   2. Enable Incoming Webhooks and add a webhook to your channel
-#   3. Add the webhook URL as SLACK_WEBHOOK_URL in repo secrets
 ##############################################################################
